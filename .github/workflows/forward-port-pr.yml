@@ -1,0 +1,90 @@
+name: Forward Port PR
+
+on:
+  pull_request:
+    types:
+      - closed
+    branches:
+      - 'rn-forward-porting-test-ga'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  create-forward-port-pr:
+    if: |
+      github.event.pull_request.merged == true &&
+      contains(github.event.pull_request.labels.*.name, 'forward-port')
+    runs-on: ubuntu-latest
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TARGET_BRANCH: rn-forward-porting-test-rc
+      MERGED_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+      SOURCE_PR_NUMBER: ${{ github.event.pull_request.number }}
+      SOURCE_PR_TITLE: ${{ github.event.pull_request.title }}
+      SOURCE_PR_URL: ${{ github.event.pull_request.html_url }}
+
+    steps:
+      - name: Check out target branch
+        uses: actions/checkout@0ad4b8fadaa221de15dcec353f45205ec38ea70b # v4.1.4
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Create forward-port branch
+        id: branch
+        run: |
+          FORWARD_PORT_BRANCH="forward-port/pr-${SOURCE_PR_NUMBER}-to-rc"
+          git checkout -b "${FORWARD_PORT_BRANCH}"
+          echo "name=${FORWARD_PORT_BRANCH}" >> "$GITHUB_OUTPUT"
+
+      - name: Cherry-pick merged commit
+        run: |
+          PARENT_COUNT="$(git rev-list --parents -n 1 "${MERGED_SHA}" | wc -w | tr -d ' ')"
+          if [ "${PARENT_COUNT}" -gt 2 ]; then
+            git cherry-pick -m 1 "${MERGED_SHA}"
+          else
+            git cherry-pick "${MERGED_SHA}"
+          fi
+
+      - name: Push forward-port branch
+        run: |
+          git push --set-upstream origin "${{ steps.branch.outputs.name }}"
+
+      - name: Check for existing forward-port PR
+        id: existing-pr
+        run: |
+          EXISTING_PR="$(gh pr list \
+            --base "${TARGET_BRANCH}" \
+            --head "${{ steps.branch.outputs.name }}" \
+            --state open \
+            --json number \
+            --jq '.[0].number')"
+
+          if [ -n "${EXISTING_PR}" ] && [ "${EXISTING_PR}" != "null" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "number=${EXISTING_PR}" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create forward-port pull request
+        if: steps.existing-pr.outputs.exists != 'true'
+        run: |
+          gh pr create \
+            --base "${TARGET_BRANCH}" \
+            --head "${{ steps.branch.outputs.name }}" \
+            --title "[FORWARD-PORT] #${SOURCE_PR_NUMBER} ${SOURCE_PR_TITLE}" \
+            --label "auto-port" \
+            --body "This PR forward-ports changes from #${SOURCE_PR_NUMBER}.\n\nSource PR: ${SOURCE_PR_URL}"
+
+      - name: Report existing PR
+        if: steps.existing-pr.outputs.exists == 'true'
+        run: |
+          echo "Forward-port PR already exists: #${{ steps.existing-pr.outputs.number }}"
